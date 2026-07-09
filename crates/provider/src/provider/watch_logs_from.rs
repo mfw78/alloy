@@ -23,6 +23,15 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "pubsub")]
+use crate::GetSubscription;
+#[cfg(feature = "pubsub")]
+use alloy_pubsub::{Subscription, SubscriptionStream};
+#[cfg(feature = "pubsub")]
+use alloy_rpc_types_eth::pubsub::SubscriptionKind;
+#[cfg(feature = "pubsub")]
+use std::future::IntoFuture;
+
 /// Logs matching a filter for a single block.
 ///
 /// This is the payload resolved by [`BlockLogsFut`] and carried by canonical log events. The
@@ -90,6 +99,8 @@ pub struct WatchLogsFrom<N: Network> {
     poll_interval: Duration,
     block_tag: BlockNumberOrTag,
     kind: BlockTransactionsKind,
+    #[cfg_attr(not(feature = "pubsub"), allow(dead_code))]
+    head_driven: bool,
     _phantom: PhantomData<fn() -> N>,
 }
 
@@ -102,8 +113,19 @@ impl<N: Network> WatchLogsFrom<N> {
             poll_interval: DEFAULT_POLL_INTERVAL,
             block_tag: BlockNumberOrTag::Latest,
             kind: BlockTransactionsKind::Hashes,
+            head_driven: false,
             _phantom: PhantomData,
         }
+    }
+
+    /// Wake the poll on `newHeads` notifications instead of only on the fixed interval, when the
+    /// transport supports pubsub. The interval remains a backstop; `eth_getLogs` stays the sole
+    /// data source, so gap-freeness and reorg handling are unchanged. HTTP transports fall back to
+    /// interval polling.
+    #[cfg(feature = "pubsub")]
+    pub const fn head_driven(mut self) -> Self {
+        self.head_driven = true;
+        self
     }
 
     /// Streams block log batches with full transaction bodies in the block response.
@@ -164,11 +186,16 @@ impl<N: Network> WatchLogsFrom<N> {
     /// receiving resolved batches in block-number order.
     pub const fn into_stream(self) -> WatchLogsFromStream<N> {
         let current_block = self.start_block;
+        #[cfg(feature = "pubsub")]
+        let head_source = if self.head_driven { HeadSource::Pending } else { HeadSource::Interval };
+        #[cfg(not(feature = "pubsub"))]
+        let head_source = HeadSource::Interval;
         WatchLogsFromStream {
             inner: self,
             current_block,
             head: 0,
             state: WatchLogsFromState::FetchHead,
+            head_source,
         }
     }
 }
@@ -183,6 +210,50 @@ pub struct WatchLogsFromStream<N: Network> {
     current_block: u64,
     head: u64,
     state: WatchLogsFromState<N>,
+    #[cfg_attr(not(feature = "pubsub"), allow(dead_code))]
+    head_source: HeadSource<N>,
+}
+
+/// Poll clock source for [`WatchLogsFromStream`].
+///
+/// The interval timer is always the backstop. When head-driven mode is on and the transport is
+/// pubsub-capable, `newHeads` notifications wake the poll early. `eth_getLogs` remains the sole
+/// data source, so `newHeads` is only a timing signal and gap-freeness and reorg handling are
+/// unchanged.
+enum HeadSource<N: Network> {
+    /// Interval polling only (default, or when the `pubsub` feature is off).
+    Interval,
+    /// Head-driven requested; the `newHeads` subscription is not yet established.
+    #[cfg(feature = "pubsub")]
+    Pending,
+    /// Establishing the `newHeads` subscription.
+    #[cfg(feature = "pubsub")]
+    Connecting(
+        futures_utils_wasm::BoxFuture<'static, TransportResult<Subscription<N::HeaderResponse>>>,
+    ),
+    /// Active `newHeads` stream driving the poll clock.
+    #[cfg(feature = "pubsub")]
+    Streaming(SubscriptionStream<N::HeaderResponse>),
+    /// Keeps `N` used when the `pubsub` feature is off.
+    #[cfg(not(feature = "pubsub"))]
+    #[allow(dead_code)]
+    Phantom(PhantomData<fn() -> N>),
+}
+
+impl<N: Network> std::fmt::Debug for HeadSource<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interval => f.write_str("Interval"),
+            #[cfg(feature = "pubsub")]
+            Self::Pending => f.write_str("Pending"),
+            #[cfg(feature = "pubsub")]
+            Self::Connecting(_) => f.write_str("Connecting"),
+            #[cfg(feature = "pubsub")]
+            Self::Streaming(_) => f.write_str("Streaming"),
+            #[cfg(not(feature = "pubsub"))]
+            Self::Phantom(_) => f.write_str("Phantom"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -268,6 +339,61 @@ impl<N: Network> Stream for WatchLogsFromStream<N> {
                     return Poll::Ready(Some(item_fut));
                 }
                 WatchLogsFromState::Sleeping { delay } => {
+                    // Head-driven clock: when pubsub is available, wake the poll on the next
+                    // `newHeads` notification rather than waiting out the interval. The interval
+                    // timer below always remains armed as a backstop, so a dropped notification
+                    // loses nothing.
+                    #[cfg(feature = "pubsub")]
+                    match &mut this.head_source {
+                        HeadSource::Pending => {
+                            let weak = this.inner.client.clone();
+                            let Some(client) = weak.upgrade() else {
+                                this.state = WatchLogsFromState::Done;
+                                continue;
+                            };
+                            let rpc_call =
+                                client.request("eth_subscribe", (SubscriptionKind::NewHeads,));
+                            let fut = GetSubscription::<_, N::HeaderResponse>::new(weak, rpc_call)
+                                .into_future();
+                            this.head_source = HeadSource::Connecting(fut);
+                            continue;
+                        }
+                        HeadSource::Connecting(fut) => match fut.as_mut().poll(cx) {
+                            Poll::Ready(Ok(sub)) => {
+                                this.head_source = HeadSource::Streaming(sub.into_stream());
+                                continue;
+                            }
+                            Poll::Ready(Err(e)) => {
+                                tracing::debug!(
+                                    %e,
+                                    "head-driven poll unavailable, falling back to interval"
+                                );
+                                this.head_source = HeadSource::Interval;
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        },
+                        HeadSource::Streaming(stream) => match Pin::new(stream).poll_next(cx) {
+                            Poll::Ready(Some(header)) => {
+                                // Use the notification's number directly, skipping the
+                                // `eth_blockNumber` round-trip.
+                                this.head = header.number();
+                                this.state = if this.current_block > this.head {
+                                    WatchLogsFromState::Sleeping {
+                                        delay: PollIntervalDelay::new(this.inner.poll_interval),
+                                    }
+                                } else {
+                                    WatchLogsFromState::Yielding
+                                };
+                                continue;
+                            }
+                            // Subscription ended: fall back to the interval timer.
+                            Poll::Ready(None) => this.head_source = HeadSource::Interval,
+                            // Both wakers are now registered; the interval below still applies.
+                            Poll::Pending => {}
+                        },
+                        HeadSource::Interval => {}
+                    }
+
                     ready!(delay.poll(cx));
                     this.state = WatchLogsFromState::FetchHead;
                 }
